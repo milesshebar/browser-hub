@@ -45,6 +45,10 @@ typeset -gA AGENT_PROFILES
 AGENT_PROFILES=()
 typeset -ga CHROME_EXTRA_ARGS
 CHROME_EXTRA_ARGS=()
+# Extractors (`hubctl run`) kept outside this repo, e.g. ones for accounts you'd rather not publish:
+# more directories, searched in order after the bundled extractors/.
+typeset -ga EXTRACTOR_DIRS
+EXTRACTOR_DIRS=()
 # Logins across Chrome updates (lib/cookies.mjs, DESIGN §1): save each profile's cookies when its
 # Chrome stops and every COOKIE_SAVE_MINUTES while it runs; put them back after an update drops them.
 COOKIE_BACKUP=1
@@ -247,6 +251,29 @@ next_ports() {  # -> "cdp hub": one above the highest in use by any profile, ski
   taken+=($c)   # skipping busy ports can walk the CDP pick up onto the hub's first candidate
   h=$((maxh + 1)); while port_up $h || (( ${taken[(Ie)$h]} )); do (( h++ )); done
   print -r -- $c $h
+}
+
+# Extractors for `hubctl run`: one file per name, the bundled extractors/ first, then each
+# EXTRACTOR_DIRS entry in order, so the first file with a name wins and a private folder can't
+# shadow a bundled extractor by accident. Files starting with _ are helpers. Outside extractors/,
+# .mjs works too (a .js there needs its own package.json saying "module": README).
+extractor_files() {
+  local d f
+  local -A seen
+  for d in $BH_ROOT/extractors $EXTRACTOR_DIRS; do
+    for f in $d/[^_]*.(js|mjs)(N-.); do
+      (( ${+seen[${f:t:r}]} )) && continue
+      seen[${f:t:r}]=1
+      print -r -- $f
+    done
+  done
+}
+extractor_path() {  # name -> its file; status 1 when there's none
+  local f
+  for f in ${(f)"$(extractor_files)"}; do
+    [[ ${f:t:r} == $1 ]] && { print -r -- $f; return 0 }
+  done
+  return 1
 }
 
 # ------------------------------------------------------------------- launchd --

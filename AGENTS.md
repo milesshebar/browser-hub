@@ -128,6 +128,8 @@ Each one was learned the hard way. `docs/DESIGN.md` has the evidence.
   one is truly gone, `./install.sh --force-hooks` takes them over.
 - **Headless machine:** set `CHROME_EXTRA_ARGS=(--headless=new)`, then run `hubctl regen`. Nobody
   can sign in through a headless window, though, so sign profiles in while headed first.
+- **Extractors that shouldn't live in this repo:** put them in a folder of their own and list it
+  in `EXTRACTOR_DIRS` in the config (README, "Look things up without a model").
 - **Different ports, or a different Chrome build:** edit the config, then run `hubctl regen`.
 - **Drive a profile on another Mac:** install browser-hub there too, with a port range of its own
   (`DEFAULT_CDP_PORT`/`DEFAULT_HUB_PORT`), then `hubctl add <host>-<profile> --remote

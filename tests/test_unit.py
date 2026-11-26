@@ -907,6 +907,79 @@ class TestRun(unittest.TestCase):
         r = self.sb.hubctl("run", "nope", "amazon", "B000000000")
         self.assertNotEqual(r.returncode, 0)
 
+    def extra_dir(self, name, files):
+        d = os.path.join(self.sb.dir, name)
+        os.makedirs(d)
+        for fn, body in files.items():
+            with open(os.path.join(d, fn), "w") as f:
+                f.write(body)
+        return d
+
+    def test_extractor_dirs_add_to_the_library(self):
+        # EXTRACTOR_DIRS: more folders of extractors (a private set kept outside the repo, say),
+        # searched after the bundled extractors/, in order. The first file with a name wins.
+        mine = self.extra_dir("mine", {"portal.js": "", "amazon.js": "", "_helpers.js": "", "notes.txt": ""})
+        more = self.extra_dir("more", {"portal.mjs": "", "quotes.mjs": ""})
+        sb = Sandbox(extra=f"EXTRACTOR_DIRS=({mine} {more} {self.sb.dir}/not-there)\n")
+        self.addCleanup(sb.cleanup)
+        files = sb.zsh("extractor_files").splitlines()
+        names = [os.path.splitext(os.path.basename(f))[0] for f in files]
+        self.assertEqual(len(names), len(set(names)), files)
+        self.assertNotIn("_helpers", names)
+        self.assertNotIn("_lib", names)
+        self.assertNotIn("notes", names)
+        self.assertEqual(sb.zsh("extractor_path amazon").strip(), os.path.join(ROOT, "extractors", "amazon.js"))
+        self.assertEqual(sb.zsh("extractor_path portal").strip(), os.path.join(mine, "portal.js"))
+        self.assertEqual(sb.zsh("extractor_path quotes").strip(), os.path.join(more, "quotes.mjs"))
+        self.assertNotEqual(subprocess.run(["zsh", "-c", f"source {ROOT}/lib/common.zsh\nextractor_path nope"],
+                                           env=sb.env, capture_output=True).returncode, 0)
+        sb.write_profile("shop", 29224, 28932)
+        r = sb.hubctl("run", "shop", "no-such-site")
+        self.assertNotEqual(r.returncode, 0)
+        for n in ("amazon", "portal", "quotes"):
+            self.assertIn(n, r.stderr)
+        self.assertNotIn("_helpers", r.stderr)
+
+    def test_no_extractor_dirs_means_the_bundled_set(self):
+        files = self.sb.zsh("extractor_files").splitlines()
+        self.assertEqual(sorted(files), sorted(glob.glob(os.path.join(ROOT, "extractors", "[!_]*.js"))))
+
+    def test_run_and_check_both_look_in_every_extractor_dir(self):
+        # `run <name>`, its "have:" list and `run --check` all go through extractor_files, so an
+        # extractor in EXTRACTOR_DIRS is found, listed and canary-checked like a bundled one.
+        with open(os.path.join(ROOT, "hubctl")) as f:
+            src = f.read()
+        self.assertNotIn("$BH_ROOT/extractors/", src)
+        self.assertIn("extractor_path", src)
+        self.assertIn("extractor_files", src)
+
+    def test_doctor_warns_about_a_missing_extractor_dir(self):
+        sb = Sandbox(extra=f"EXTRACTOR_DIRS=({self.sb.dir}/not-there)\n")
+        self.addCleanup(sb.cleanup)
+        r = sb.hubctl("doctor", "--no-mcp", "--no-hooks", "--no-claude-md")
+        self.assertIn(f"warn  EXTRACTOR_DIRS: {self.sb.dir}/not-there is not a directory", r.stdout)
+
+    @unittest.skipUnless(shutil.which("node"), "needs node")
+    def test_an_extractor_elsewhere_can_use_the_helpers(self):
+        # The README's recipe for a folder outside the repo: a package.json that says "module"
+        # (Node 18 reads .js as CommonJS without it) and a link to the bundled _lib.js.
+        d = self.extra_dir("private", {
+            "package.json": '{"type": "module"}\n',
+            "portal.js": textwrap.dedent("""\
+                import { wallFrom } from './_lib.js';
+                export const name = 'portal';
+                export const url = id => `https://portal.example.com/item/${id}`;
+                export async function lookup(page, id) { return wallFrom({ url: url(id) }) || { status: 'ok' }; }
+                """)})
+        os.symlink(os.path.join(ROOT, "extractors", "_lib.js"), os.path.join(d, "_lib.js"))
+        r = subprocess.run(["node", "--help"], capture_output=True, text=True)
+        flag = ["--no-experimental-detect-module"] if "detect-module" in r.stdout else []
+        script = (f"const m = await import({json.dumps('file://' + os.path.join(d, 'portal.js'))});"
+                  "console.log(JSON.stringify([m.name, m.url('X1'), typeof m.lookup]))")
+        r = subprocess.run(["node", *flag, "--input-type=module", "-e", script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr[-400:])
+        self.assertEqual(json.loads(r.stdout), ["portal", "https://portal.example.com/item/X1", "function"])
+
     @unittest.skipUnless(shutil.which("node"), "needs node")
     def test_every_extractor_exports_the_contract(self):
         script = textwrap.dedent("""

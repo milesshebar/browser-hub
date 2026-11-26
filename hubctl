@@ -34,8 +34,9 @@ hubctl — browser-hub $BH_VERSION
   regen                       rewrite every launchd job from the config and apply the changes
   reload <profile>            apply a changed job right now (closes that Chrome and its tabs)
   run <profile> <extractor> [id...]
-                              look things up with extractors/<name>.js (or a path to one) in a
-                              tab of its own; prints JSON. Exit 0 ok, 3 nulls/not found, 4 blocked
+                              look things up with extractors/<name>.js (or EXTRACTOR_DIRS, or a
+                              path to one) in a tab of its own; prints JSON. Exit 0 ok, 3 nulls/not
+                              found, 4 blocked
   run <profile> --check       run every extractor against its known-good ids, one line each
   reap                        stop profiles idle > ${IDLE_MINUTES}m (launchd runs this on a timer)
   doctor                      check the whole install and say what's wrong
@@ -453,7 +454,7 @@ run_check() {  # profile
   local f bad=0
   cmd_up $1 >/dev/null || return 1
   local nm; nm=$(pw_modules) || return 1
-  for f in $BH_ROOT/extractors/[^_]*.js(N); do
+  for f in ${(f)"$(extractor_files)"}; do
     $NODE_BIN/node $BH_ROOT/lib/run-extractor.mjs $nm $(cdp_port $1) $f --canary || (( ++bad ))
   done
   stamp $1
@@ -476,9 +477,14 @@ cmd_run() {
     return $rc
   fi
   [[ $x == --check ]] && { run_check $n; return }
-  local f=$BH_ROOT/extractors/$x.js
-  [[ $x == */* ]] && f=${x:A}          # a path: try out an extractor before it joins the library
-  [[ -f $f ]] || die "no extractor '$x' (have: ${(j:, :)${(@)$(print -l $BH_ROOT/extractors/[^_]*.js(N:t:r))}})"
+  local f; local -a have
+  if [[ $x == */* ]]; then f=${x:A}     # a path: try out an extractor before it joins the library
+  else f=$(extractor_path $x); fi
+  if [[ ! -f $f ]]; then
+    have=(${(f)"$(extractor_files)"})
+    have=(${have:t:r})
+    die "no extractor '$x' (have: ${(j:, :)have})"
+  fi
   (( $# )) || die "usage: hubctl run $n $x <id...>"
   cmd_up $n >/dev/null || return 1     # cold-starts if needed, and stamps it: the reaper won't stop it mid-run
   local nm; nm=$(pw_modules) || return 1
@@ -805,6 +811,9 @@ cmd_doctor() {  # [--no-mcp] [--no-hooks] [--no-claude-md]: parts deliberately n
   (( $+commands[python3] )) && ok "python3" || bad "python3 not found (install Xcode command line tools)"
   local sp=$(paths_with_spaces)
   [[ -z $sp ]] || bad "paths with spaces aren't supported: ${sp//$'\n'/, }"
+  for p in $EXTRACTOR_DIRS; do
+    [[ -d $p ]] || meh "EXTRACTOR_DIRS: $p is not a directory"
+  done
 
   print -r -- "profiles"
   for n in $(profiles); do

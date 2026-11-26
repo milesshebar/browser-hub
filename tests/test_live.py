@@ -77,6 +77,7 @@ class TestLive(unittest.TestCase):
                 DEFAULT_CDP_PORT={PORTS['cdp']}
                 DEFAULT_HUB_PORT={PORTS['hub']}
                 CHROME_EXTRA_ARGS=({headless})
+                EXTRACTOR_DIRS=({cls.tmp}/extractors)
                 """) + (f"PW_MCP={pw}\n" if pw else ""))
         # A stand-in for the `claude` CLI: remembers one MCP server in a file.
         cls.claude = os.path.join(cls.tmp, "claude")
@@ -405,6 +406,12 @@ class TestLive(unittest.TestCase):
         self.assertEqual(out["items"][0]["data"], {"title": "bh-live-test", "h1": "hello"})
         self.assertEqual(tabs(), before, "run closes its own tab and touches no other")
         self.assertLess(time.time() - os.stat(stamp).st_mtime, 60, "run stamps the profile")
+        # The same extractor by name, from a folder listed in EXTRACTOR_DIRS.
+        os.makedirs(os.path.join(self.tmp, "extractors"))
+        shutil.copy(ex, os.path.join(self.tmp, "extractors", "title.mjs"))
+        r = self.hubctl("run", "t1", "title", self.site)
+        self.assertEqual(json.loads(r.stdout)["items"][0]["data"], {"title": "bh-live-test", "h1": "hello"})
+        self.assertEqual(tabs(), before)
         # A failing lookup still closes its tab, and says so through the exit code.
         with open(ex, "a") as f:
             f.write("export const required = ['missing'];\n")

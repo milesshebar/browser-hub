@@ -55,6 +55,10 @@ SNAPSHOT_MODE=none         # "none": no page snapshot after each click/navigate 
 DISK_CACHE_BYTES=209715200 # cap each profile's HTTP cache at 200 MB (0 = Chrome's default, which grows to GBs)
 CHROME_EXTRA_ARGS=()       # extra Chrome flags, e.g. (--headless=new) on a machine nobody looks at
 
+# More folders of extractors for `hubctl run`, searched in order after the bundled extractors/
+# (a bundled one wins a name clash). README "Look things up without a model" says how to set one up.
+# EXTRACTOR_DIRS=($HOME/my-extractors)
+
 # Logins across Chrome updates: hubctl saves each profile's cookies (from the running Chrome) when
 # it stops it and every COOKIE_SAVE_MINUTES, and puts them back when an update drops them (DESIGN §1).
 COOKIE_BACKUP=1

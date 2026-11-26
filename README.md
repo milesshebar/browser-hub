@@ -185,6 +185,16 @@ over. Pass a path instead of a name to try one out before adding it. Outside `ex
 the file `.mjs`: without that folder's `package.json`, older Node versions (18 among them) read a
 `.js` file as CommonJS and fail on its `import`.
 
+Extractors you'd rather not keep in this repo (for an account of your own, say) can live in a
+folder of their own: list it in the config as `EXTRACTOR_DIRS=($HOME/my-extractors)`, and
+`hubctl run`, its list of names and `--check` include them, after the bundled ones. To use the
+bundled helpers from there, link them in and mark the folder as ES modules:
+
+```sh
+ln -s <this repo>/extractors/_lib.js ~/my-extractors/_lib.js
+echo '{"type": "module"}' > ~/my-extractors/package.json   # or name the files .mjs
+```
+
 **Drive a profile from your own scripts.** Run `hubctl up <profile>`, then connect to its CDP port
 (`hubctl list` shows it). Open your own tab, use it and close it. Never adopt an existing tab by
 URL, because in a shared browser that tab belongs to someone else.

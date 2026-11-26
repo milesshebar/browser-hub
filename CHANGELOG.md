@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+**New**
+- `EXTRACTOR_DIRS` in the config: more folders of extractors for `hubctl run`, searched after the
+  bundled `extractors/`, so extractors for accounts you'd rather not publish can live outside the
+  repo. `run <name>`, its list of names and `run --check` all include them; a bundled extractor
+  wins a name clash. `hubctl doctor` warns about a listed folder that doesn't exist.
+
 ## 1.1.0 — 2026-11-25
 
 **Upgrading.** Pull, then run `./install.sh` (or at least `hubctl regen`). That rewrites every
