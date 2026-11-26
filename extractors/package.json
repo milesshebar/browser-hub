@@ -1,0 +1,4 @@
+{
+  "//": "Extractors are ES modules. Node 18 reads a .js file as CommonJS unless this says otherwise.",
+  "type": "module"
+}

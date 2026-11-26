@@ -1,0 +1,1025 @@
+#!/bin/zsh
+# hubctl — run the browser hub: one launchd-managed Chrome + playwright-mcp hub per profile.
+# `hubctl help` lists the commands. Machine-specific settings live in one config file
+# ($BROWSER_HUB_CONFIG, default ~/.config/browser-hub/config); see config.example.
+source ${0:A:h}/lib/common.zsh
+zmodload zsh/system zsh/datetime
+zmodload -F zsh/stat b:zstat
+
+usage() {
+  cat <<EOF
+hubctl — browser-hub $BH_VERSION
+
+  list                        every profile: ports, whether Chrome and its hub are up, last use
+  up [profile]                start a profile if it's cold, repair a stale hub, mark it in use
+  down [profile]              stop a profile's Chrome (the default profile's hub stays up)
+  open <profile> [url...]     bring a profile up and open tabs in it (e.g. to sign in)
+  add <profile> [--identity "who it's signed in as"] [--ports CDP:HUB]
+                              create a profile: ports, launchd jobs, agent
+  add <name> --remote <ssh-host>:<profile> [--hubctl "<command on that Mac>"]
+                              reach a profile that runs on another Mac's browser-hub, over ssh
+  push <remote-profile> [--stop]
+                              copy this Mac's profile of the same name over the one on the other
+                              Mac (logins, extensions, history); --stop stops both Chromes first
+  pull <remote-profile> [--stop]
+                              the same, the other way
+  info <profile>              key=value facts about a profile (what add --remote asks the other Mac)
+  cookies <profile> save | restore [--from <file>]
+                              save a running profile's cookies, or put saved ones back (hubctl does
+                              both on its own around Chrome updates; see DESIGN §1)
+  rm <profile>                remove a profile's jobs, label and agents (keeps its browser data)
+  agent <profile> [--identity "..."] [--force]
+                              write the profile's browser-<profile> agent (--force: overwrite)
+  lanes <profile> <count>     clone browser-<profile> into parallel-safe lanes -2 … -<count>
+  regen                       rewrite every launchd job from the config and apply the changes
+  reload <profile>            apply a changed job right now (closes that Chrome and its tabs)
+  run <profile> <extractor> [id...]
+                              look things up with extractors/<name>.js (or a path to one) in a
+                              tab of its own; prints JSON. Exit 0 ok, 3 nulls/not found, 4 blocked
+  run <profile> --check       run every extractor against its known-good ids, one line each
+  reap                        stop profiles idle > ${IDLE_MINUTES}m (launchd runs this on a timer)
+  doctor                      check the whole install and say what's wrong
+  version
+
+Profile "default" is the one the main session drives through mcp__playwright__*.
+EOF
+}
+
+# ------------------------------------------------------------------- helpers --
+
+stamp() {  # profile — marks it in use; the reaper leaves it alone for IDLE_MINUTES from here
+  touch $RUN_DIR/last-use-$1 2>/dev/null || { mkdir -p $RUN_DIR && touch $RUN_DIR/last-use-$1 }
+}
+
+front_app() {  # bundle id of the frontmost app; lsappinfo needs no permissions, unlike AppleScript
+  [[ $(lsappinfo info -only bundleid "$(lsappinfo front 2>/dev/null)" 2>/dev/null) == *'="'(#b)([^\"]##)'"'* ]] &&
+    print -r -- $match[1]
+}
+
+# A cold start launches a headed Chrome, and macOS makes it the active app: it took keyboard focus
+# from whatever the person was typing in (measured: 78 of 80 samples over 8 s, 2026-11-11). Once
+# Chrome has come to the front, hand focus back to the app that had it. In the background, so the
+# start isn't slowed, and only when someone else had focus: `hubctl open` wants the window.
+front_pid() {
+  [[ $(lsappinfo info -only pid "$(lsappinfo front 2>/dev/null)" 2>/dev/null) == *'='(#b)(<->)* ]] && print -r -- $match[1]
+}
+
+give_focus_back() {  # bundle-id-before chrome-pid
+  local before=${1:-} pid=${2:-} i
+  [[ -n $before && -n $pid && $before != com.google.Chrome && $before != com.apple.loginwindow ]] || return 0
+  headless && return 0
+  # Chrome activates more than once while it starts (the app, then its window), so keep watching
+  # for 10 s and hand focus back each time, rather than once. Only this profile's Chrome, by pid:
+  # the person's own Chrome has the same bundle id, and switching to it must not be undone.
+  # Detached from every fd: the hook captures `hubctl up`'s output, and an inherited pipe would
+  # make it wait out the whole loop.
+  {
+    for i in {1..50}; do
+      [[ $(front_pid) == $pid ]] && open -b $before
+      sleep 0.2
+    done
+  } </dev/null >/dev/null 2>&1 &!
+}
+
+wait_port() {  # port seconds
+  local i
+  for i in {1..$(( $2 * 4 ))}; do port_up $1 && return 0; sleep 0.25; done
+  return 1
+}
+
+wait_port_down() {  # port seconds
+  local i
+  for i in {1..$(( $2 * 4 ))}; do port_up $1 || return 0; sleep 0.25; done
+  return 1
+}
+
+# A hub counts as restarted once launchd reports a new pid AND its port answers.
+wait_hub() {  # label port old-pid seconds
+  local i pid
+  for i in {1..$(( $4 * 4 ))}; do
+    pid=$(lc_pid $1)
+    [[ -n $pid && $pid != $3 ]] && port_up $2 && return 0
+    sleep 0.25
+  done
+  return 1
+}
+
+rotate_log() {  # file — only called when the job writing it is about to (re)start
+  local f=$1
+  [[ -f $f ]] || return 0
+  (( $(zstat +size $f) > LOG_MAX_MB * 1048576 )) && mv -f $f $f.1
+  return 0
+}
+
+age_of() {  # file -> "12m" / "3h" / "4d" / "-"
+  [[ -f $1 ]] || { print -- -; return }
+  local s=$(( EPOCHSECONDS - $(zstat +mtime $1) ))
+  if (( s < 3600 )); then print -- $(( s / 60 ))m
+  elif (( s < 172800 )); then print -- $(( s / 3600 ))h
+  else print -- $(( s / 86400 ))d; fi
+}
+
+log_line() { print -r -- "$(strftime '%Y-%m-%d %H:%M:%S' $EPOCHSECONDS) $*" }
+
+# Does a playwright-mcp answer on this port? Opens an MCP session and closes it again.
+mcp_ping() {  # port
+  local hdr=$(mktemp) body sid
+  body=$(curl -s -m 5 -D $hdr -X POST http://localhost:$1/mcp \
+    -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"hubctl","version":"1"}}}')
+  sid=$(awk -F': ' 'tolower($1)=="mcp-session-id"{print $2}' $hdr | tr -d '\r')
+  [[ -n $sid ]] && curl -s -m 3 -X DELETE http://localhost:$1/mcp -H "mcp-session-id: $sid" >/dev/null
+  rm -f $hdr
+  [[ $body == *serverInfo* ]]
+}
+
+need_profile() {  # profile — exit 3 (distinct, so the hook can tell) when it doesn't exist
+  [[ $1 == default ]] || valid_name $1 || die "'$1' is not a valid profile name"
+  profile_exists $1 || { print -u2 -r -- "hubctl: unknown profile '$1' (hubctl list shows them)"; exit 3 }
+  [[ $1 == default || -f $(plist_of $(hub_label $1)) ]] || is_remote $1 ||
+    die "profile '$1' is incomplete (its hub plist is missing): hubctl rm $1, then hubctl add $1"
+}
+
+# Write one job's plist and make launchd use it, without disturbing anything that is running.
+apply_job() {  # label content
+  local l=$1
+  if put_plist $l "$2" || [[ ! -L $(la_of $l) ]] || [[ $(readlink $(la_of $l)) != $(plist_of $l) ]]; then
+    link_plist $l
+    if ! lc_loaded $l; then
+      lc_bootstrap $l || warn "could not load $l into launchd"
+    elif ! lc_running $l; then
+      lc_reload $l || warn "could not reload $l"; clear_stale $l
+    elif [[ $l == $(hub_label default) || $l == $REAPER_LABEL ]]; then
+      # Restarting the always-on hub is safe under live sessions: Claude Code reconnects on the
+      # next tool call. It must restart now, because it never has a "next cold start". (The
+      # reaper is a one-shot, so interrupting it costs nothing either.)
+      lc_reload $l || warn "could not reload $l"; clear_stale $l
+      print -r -- "  restarted $l"
+    else
+      mark_stale $l
+      print -r -- "  $l is running — the change applies at its next start (or now: hubctl reload)"
+    fi
+  elif ! lc_loaded $l; then
+    lc_bootstrap $l || warn "could not load $l into launchd"
+  fi
+}
+
+write_agent() {  # profile identity force
+  local n=$1 id=${2:-} force=${3:-0} f=$AGENTS_DIR/browser-$1.md
+  if [[ -e $f && $force != 1 ]]; then print -r -- "  kept existing agent $f"; return 0; fi
+  if [[ -z $id ]]; then
+    if [[ $n == default ]]; then
+      id="the general-purpose default profile, the same browser the main session drives through mcp__playwright__*"
+    else
+      id="the accounts signed into the \"$n\" profile"
+    fi
+  fi
+  [[ $id == *$'\n'* ]] && die "--identity must be a single line"
+  # The description is a double-quoted YAML scalar: a colon or " #" in plain YAML would break
+  # the frontmatter or silently truncate it.
+  local yaml=${${id//\\/\\\\}//\"/\\\"}
+  mkdir -p $AGENTS_DIR
+  render $BH_ROOT/templates/agent.md AGENT=browser-$n PROFILE=$n IDENTITY=$id IDENTITY_YAML=$yaml \
+    HUB_URL=$(hub_url $n) HUBCTL="$(hubctl_command)" OUTPUT_DIR=$OUT_DIR/$n > $f
+  print -r -- "  wrote agent $f"
+}
+
+# A remote profile's agent is a copy of the agent for this Mac's profile of the same name (that
+# agent already says which accounts the profile holds), retargeted at the tunnel and told that its
+# Chrome is on the other Mac. Without such an agent, it starts from the template.
+write_remote_agent() {  # profile force
+  local n=$1 force=${2:-0} f=$AGENTS_DIR/browser-$1.md a base=
+  if [[ -e $f && $force != 1 ]]; then print -r -- "  kept existing agent $f"; return 0; fi
+  local rp=$(remote_field $n BH_REMOTE_PROFILE) dest=$(remote_field $n BH_REMOTE_SSH)
+  if profile_exists $rp && ! is_remote $rp; then
+    local h=$(hub_port $rp)
+    base=$AGENTS_DIR/browser-$rp.md
+    if [[ ! -f $base ]] || ! grep -qF "localhost:$h/mcp" $base; then
+      base=
+      for a in ${(f)"$(agents_using $h)"}; do
+        [[ ${a:t:r} == *-<-> ]] && continue          # a lane: its base is in the list too
+        base=$a; break
+      done
+    fi
+  fi
+  mkdir -p $AGENTS_DIR
+  local tmp=$f.tmp-$$
+  if [[ -n $base ]]; then
+    cp $base $tmp
+  else
+    local id="the same accounts as the \"$rp\" profile on $dest"
+    render $BH_ROOT/templates/agent.md AGENT=browser-$n PROFILE=$n IDENTITY=$id IDENTITY_YAML=$id \
+      HUB_URL=$(hub_url $n) HUBCTL="$(hubctl_command)" OUTPUT_DIR=$OUT_DIR/$rp > $tmp
+  fi
+  python3 $BH_ROOT/lib/claude_config.py remote-agent $tmp $f browser-$n $(hub_url $n) $n \
+    $([[ -n $base ]] && print -r -- $rp || print -r -- $n) $dest "$(hubctl_command)" $rp ||
+    { rm -f $tmp; die "could not write $f" }
+  rm -f $tmp
+  print -r -- "  wrote agent $f${base:+ (from ${base:t})}"
+}
+
+# Facts about a profile, one key=value per line. `add --remote` and `doctor` read them over ssh.
+cmd_info() {
+  local n=${1:-default}
+  need_profile $n
+  print -r -- "version=$BH_VERSION"
+  print -r -- "profile=$n"
+  if is_remote $n; then
+    print -r -- "remote=$(remote_field $n BH_REMOTE_SSH):$(remote_field $n BH_REMOTE_PROFILE)"
+    print -r -- "hub=$(hub_port $n)"
+    return 0
+  fi
+  print -r -- "cdp=$(cdp_port $n)"
+  print -r -- "hub=$(hub_port $n)"
+  print -r -- "dir=$(profile_dir $n)"
+  print -r -- "chrome=$(chrome_stopped $n && print down || print up)"
+}
+
+info_field() {  # info-text key
+  local l
+  for l in ${(f)1}; do [[ $l == $2=* ]] && { print -r -- ${l#*=}; return 0 }; done
+  return 1
+}
+
+# ------------------------------------------------------------------ commands --
+
+cmd_list() {
+  printf "%-12s %-6s %-6s %-7s %-7s %-9s %s\n" PROFILE CDP HUB CHROME HUB LAST-USE AGENTS
+  local n c h a k
+  local -a names
+  for n in $(profiles); do
+    c=$(cdp_port $n); h=$(hub_port $n)
+    names=($AGENTS_DIR/browser-$n.md(N:t:r))
+    a=($AGENTS_DIR/browser-$n-<->.md(N))
+    (( $#a && $#names )) && names[1]+=" (+$#a lane$( (( $#a > 1 )) && print s))"
+    for k in ${(k)AGENT_PROFILES}; do [[ $AGENT_PROFILES[$k] == $n ]] && names+=($k); done
+    if is_remote $n; then
+      # Its Chrome is on the other Mac; asking over ssh would make `list` hang on a sleeping
+      # laptop. HUB is the tunnel. `hubctl info <profile>` there tells the rest.
+      printf "%-12s %-6s %-6s %-7s %-7s %-9s %s\n" $n - ${h:-?} remote \
+        "$(port_up ${h:-0} && print up || print down)" "$(age_of $RUN_DIR/last-use-$n)" \
+        "${(j:, :)names:--} (on $(remote_field $n BH_REMOTE_SSH):$(remote_field $n BH_REMOTE_PROFILE))"
+      continue
+    fi
+    printf "%-12s %-6s %-6s %-7s %-7s %-9s %s\n" $n ${c:-?} ${h:-?} \
+      "$(port_up ${c:-0} && print up || print down)" "$(port_up ${h:-0} && print up || print down)" \
+      "$(age_of $RUN_DIR/last-use-$n)" "${(j:, :)names:--}"
+  done
+}
+
+cmd_up() {
+  local n=${1:-default}
+  need_profile $n
+  is_remote $n && { up_remote $n; return }
+  local c=$(cdp_port $n) h=$(hub_port $n) owed=$RUN_DIR/hub-restart-owed-$n
+
+  # Fast path, and the common case: the PreToolUse hook runs this before every browser tool call.
+  # Everything the profile has must be live — Chrome can be quit from its UI while the hub keeps
+  # listening, and a hub-only check would hand an agent a hub with no browser behind it — and no
+  # hub restart may be owed (see below).
+  if port_up $c && port_up $h && [[ ! -e $owed ]]; then stamp $n; print -r -- "$n already up (hub $h)"; return 0; fi
+
+  # Slow path, serialised per profile: parallel agent spawns fire this hook together, and two
+  # racing cold starts would each restart the hub under the other.
+  local lockfd lock=$RUN_DIR/up-$n.lock
+  [[ -e $lock ]] || { mkdir -p $RUN_DIR && : >> $lock } || die "cannot create $lock"
+  zsystem flock -t 120 -f lockfd $lock || die "timed out waiting for another 'hubctl up $n' to finish"
+  if port_up $c && port_up $h && [[ ! -e $owed ]]; then stamp $n; print -r -- "$n already up (hub $h)"; return 0; fi
+
+  # A profile that just failed to start fails again at once, instead of making every queued
+  # browser call wait out the same timeouts.
+  local failed=$RUN_DIR/failed-$n
+  if [[ -e $failed ]] && (( EPOCHSECONDS - $(zstat +mtime $failed) < 60 )); then
+    die "'$n' failed to start less than a minute ago: $(<$failed)"
+  fi
+
+  local cl=$(chrome_label $n) hl=$(hub_label $n) old
+  # Before Chrome starts: it would create the profile under the umask. Never start it on a profile
+  # other users can read.
+  secure_profile_dir $n || die "'$n' not started: its profile directory is not private (above)"
+  link_native_hosts $n >/dev/null   # before Chrome starts, so extensions find their desktop app at once
+  if ! port_up $c; then
+    # Starting Chrome puts us in debt: with --shared-browser-context, Chrome dying under a live hub
+    # leaves every connected client holding a destroyed context, and every later call fails
+    # ("Cannot read properties of undefined (reading 'once')") — permanently, even once Chrome is
+    # back. Only a hub restart clears it (safe under live sessions: Claude Code reconnects on its
+    # next call). The debt is recorded on disk, so an interrupted start — Ctrl-C, a killed hook, a
+    # Chrome slower than the timeout — can't leave the fast path serving a poisoned hub.
+    : > $owed
+    rotate_log $LOG_DIR/chrome-$n.log
+    if is_stale $cl; then lc_reload $cl && clear_stale $cl; fi   # safe: this Chrome isn't running
+    local front=$(front_app)
+    lc_kick $cl || fail_up $n "could not start Chrome (see $LOG_DIR/chrome-$n.log)"
+    wait_port $c 30 || fail_up $n "Chrome never opened CDP port $c (see $LOG_DIR/chrome-$n.log)"
+    (( ${BH_KEEP_FOCUS:-0} )) || give_focus_back "$front" "$(lc_pid $cl)"
+    cookies_after_start $n
+  fi
+
+  if [[ -e $owed ]] || ! port_up $h; then
+    old=$(lc_pid $hl)
+    rotate_log $LOG_DIR/hub-$n.log
+    if is_stale $hl; then
+      lc_reload $hl && clear_stale $hl
+      lc_kick $hl || fail_up $n "could not start the hub"
+    else
+      lc_kick $hl -k || fail_up $n "could not start the hub"
+    fi
+    wait_hub $hl $h "${old:-}" 60 || fail_up $n "the hub never came up on $h (see $LOG_DIR/hub-$n.log)"
+    rm -f $owed
+  fi
+  rm -f $failed
+  stamp $n
+  print -r -- "$n up (CDP $c, hub $h)"
+}
+
+fail_up() {  # profile message
+  print -r -- $2 > $RUN_DIR/failed-$1
+  die "$1: $2"
+}
+
+# Is the tunnel's ssh master alive? Asking it is local (~5 ms). A probe of the forwarded port would
+# open a channel to the other Mac on every hook call, and log a failure there whenever its hub is
+# down. A live master means the forward is bound: it runs with ExitOnForwardFailure.
+# ------------------------------------------------------------- saved cookies --
+# lib/cookies.mjs keeps each profile's cookies in <profile dir>/browser-hub-cookies.json, written
+# from the running Chrome, so a Chrome update that drops the jar can be undone (DESIGN §1). None of
+# this may fail the command around it: its result goes to cookies.log.
+cookie_file() { print -r -- $(profile_dir $1)/browser-hub-cookies.json }
+
+cookies_run() {  # profile save|restore [args...] — prints the helper's one-line result
+  local n=$1; shift
+  is_remote $n && return 0                 # the other Mac keeps its own
+  port_up $(cdp_port $n) || return 0
+  local nm; nm=$(pw_modules 2>/dev/null) || { print -r -- '{"error":"no playwright-core"}'; return 1 }
+  $NODE_BIN/node $BH_ROOT/lib/cookies.mjs $nm $(cdp_port $n) $(profile_dir $n) "$@" 2>&1
+}
+
+cookies_auto() {  # profile save|restore... — the automatic calls: logged, quiet, never fatal
+  (( COOKIE_BACKUP )) || return 0
+  local out rc
+  out=$(cookies_run "$@"); rc=$?
+  [[ -n $out ]] && { mkdir -p $LOG_DIR; log_line "$1 ${2}: ${out//$'\n'/ | }" >> $LOG_DIR/cookies.log }
+  return $rc
+}
+
+# Called right after a cold start. Costs one curl unless Chrome's version changed since the last
+# save; then the helper decides whether the jar collapsed and puts it back.
+cookies_after_start() {  # profile
+  (( COOKIE_BACKUP )) || return 0
+  local n=$1 f=$(cookie_file $1) saved now
+  [[ -f $f ]] || return 0
+  [[ $(head -c 160 $f) == *'"chrome":'[[:space:]]#'"'(#b)([^\"]##)'"'* ]] && saved=$match[1]
+  [[ $(curl -s -m 3 http://localhost:$(cdp_port $n)/json/version) == *'"Browser":'[[:space:]]#'"'(#b)([^\"]##)'"'* ]] && now=${match[1]#*/}
+  [[ -n $saved && -n $now && $saved != $now ]] || return 0
+  cookies_auto $n restore --if-updated
+  cookies_auto $n save
+  return 0
+}
+
+tunnel_ok() {  # profile
+  [[ -S $(ssh_sock $1) ]] &&
+    $SSH_BIN -S $(ssh_sock $1) -O check -- $(remote_field $1 BH_REMOTE_SSH) >/dev/null 2>&1
+}
+
+# A remote profile: make sure the tunnel is up, then run `hubctl up` for the profile on the other
+# Mac. That side does everything a local `up` does (cold start, the owed hub restart, the lock,
+# the stamp its reaper reads), so it isn't repeated here. Over the tunnel's master connection the
+# whole thing costs ~100 ms, which the hook pays before every browser call. It never exits 3: the
+# hook reads 3 as "not a browser-hub profile" and would hide the failure.
+up_remote() {  # profile
+  local n=$1 h=$(hub_port $1) rp=$(remote_field $1 BH_REMOTE_PROFILE) dest=$(remote_field $1 BH_REMOTE_SSH)
+  local tl=$(tunnel_label $1) failed=$RUN_DIR/failed-$1 started=0 out rc i
+  [[ $h == <-> && -n $rp && -n $dest ]] || die "remote profile '$n' has an incomplete record (hubctl rm $n, then add it again)"
+  mkdir -p $RUN_DIR $LOG_DIR
+  if ! tunnel_ok $n; then
+    # A laptop that's asleep fails every call the same way; say so at once instead of making each
+    # queued call wait out the ssh timeout again. (With the tunnel up, the other Mac's own `up`
+    # fails fast for its own failures.)
+    if [[ -e $failed ]] && (( EPOCHSECONDS - $(zstat +mtime $failed) < 60 )); then
+      die "'$n' failed to start less than a minute ago: $(<$failed)"
+    fi
+    local lockfd lock=$RUN_DIR/up-$n.lock
+    [[ -e $lock ]] || : >> $lock || die "cannot create $lock"
+    zsystem flock -t 60 -f lockfd $lock || die "timed out waiting for another 'hubctl up $n' to finish"
+    if ! tunnel_ok $n; then
+      if ! lc_running $tl; then
+        rotate_log $LOG_DIR/tunnel-$n.log
+        if is_stale $tl; then lc_reload $tl && clear_stale $tl; fi
+        # A socket left by an ssh that died makes the new one give up being the master.
+        rm -f $(ssh_sock $n)
+        lc_kick $tl || fail_up $n "could not start the ssh tunnel (see $LOG_DIR/tunnel-$n.log)"
+        started=1
+      fi
+      # Connecting takes ~0.3 s on a LAN. ssh gives up after ConnectTimeout (5 s) and exits. launchd
+      # takes a moment to report a just-kicked job as running, so an early "not running" means nothing.
+      for i in {1..48}; do
+        tunnel_ok $n && break
+        (( i > 8 )) && ! lc_running $tl && break
+        sleep 0.25
+      done
+      tunnel_ok $n || fail_up $n "can't reach $dest over ssh: asleep, offline, or refusing the key? (see $LOG_DIR/tunnel-$n.log)"
+    fi
+  fi
+  out=$(remote_hubctl $n up $rp 2>&1); rc=$?
+  (( rc == 255 )) && fail_up $n "lost the ssh connection to $dest: ${out//$'\n'/ }"
+  (( rc == 0 )) || fail_up $n "on $dest: ${out//$'\n'/ }"
+  rm -f $failed
+  stamp $n
+  # The hook logs only output without "already up", so a tunnel start reads as a start.
+  (( started )) && out="tunnel started; ${out//already up/was up}"
+  print -r -- "$n -> $dest: $out"
+}
+
+# Scripted lookups: extractors/<name>.js run over CDP in a tab of their own. Uses the playwright-core
+# that the pinned playwright-mcp already ships in the npx cache, so there's nothing new to install
+# and the API is the one agents already write in browser_run_code_unsafe.
+pw_modules() {
+  # Cached per PW_MCP version: asking npx costs ~1 s, and the answer only changes with the pin.
+  local f=$RUN_DIR/pw-modules-${PW_MCP//[^A-Za-z0-9.]/_} d
+  [[ -f $f ]] && d=$(<$f) && [[ -d $d/playwright-core ]] && { print -r -- $d; return 0 }
+  # From RUN_DIR: in a directory with its own node_modules, npx could resolve the package there.
+  mkdir -p $RUN_DIR
+  d=$(cd $RUN_DIR && PATH=$NODE_BIN:$PATH $NODE_BIN/npx -y -p $PW_MCP -c 'echo "${PATH%%:*}"' 2>/dev/null)
+  d=${d%/.bin}
+  [[ -d $d/playwright-core ]] || die "can't find the playwright-core that $PW_MCP ships (looked in '$d')"
+  # Only an exact version is safe to remember; a tag like @latest moves.
+  [[ $PW_MCP == *@<->.<->.<->* ]] && print -r -- $d > $f
+  print -r -- $d
+}
+
+# Every extractor against its own canary ids: one line each. A selector that rotted shows up here
+# as partial/error before an agent trusts a wrong number.
+run_check() {  # profile
+  local f bad=0
+  cmd_up $1 >/dev/null || return 1
+  local nm; nm=$(pw_modules) || return 1
+  for f in $BH_ROOT/extractors/[^_]*.js(N); do
+    $NODE_BIN/node $BH_ROOT/lib/run-extractor.mjs $nm $(cdp_port $1) $f --canary || (( ++bad ))
+  done
+  stamp $1
+  return $(( bad ? 3 : 0 ))
+}
+
+cmd_run() {
+  local n=${1:-} x=${2:-}
+  [[ -n $n && -n $x ]] || die "usage: hubctl run <profile> <extractor> <id...> | hubctl run <profile> --check"; shift 2
+  # Exit 3 means "some items came back empty" to callers, so an unknown profile must not use
+  # need_profile's 3.
+  profile_exists $n || die "unknown profile '$n' (hubctl list)"
+  if is_remote $n; then
+    # Over there, against its own Chrome. A path to an extractor would name a file on this Mac.
+    [[ $x == */* ]] && die "a remote profile runs the other Mac's extractors; name one, not a path"
+    cmd_up $n >/dev/null || return 1
+    remote_hubctl $n run $(remote_field $n BH_REMOTE_PROFILE) $x "$@"
+    local rc=$?
+    (( rc == 255 )) && { warn "lost the ssh connection to $(remote_field $n BH_REMOTE_SSH)"; return 1 }
+    return $rc
+  fi
+  [[ $x == --check ]] && { run_check $n; return }
+  local f=$BH_ROOT/extractors/$x.js
+  [[ $x == */* ]] && f=${x:A}          # a path: try out an extractor before it joins the library
+  [[ -f $f ]] || die "no extractor '$x' (have: ${(j:, :)${(@)$(print -l $BH_ROOT/extractors/[^_]*.js(N:t:r))}})"
+  (( $# )) || die "usage: hubctl run $n $x <id...>"
+  cmd_up $n >/dev/null || return 1     # cold-starts if needed, and stamps it: the reaper won't stop it mid-run
+  local nm; nm=$(pw_modules) || return 1
+  $NODE_BIN/node $BH_ROOT/lib/run-extractor.mjs $nm $(cdp_port $n) $f "$@"
+  local rc=$?
+  stamp $n
+  return $rc
+}
+
+cmd_down() {
+  local n=${1:-default}
+  need_profile $n
+  if is_remote $n; then
+    local out
+    out=$(remote_hubctl $n down $(remote_field $n BH_REMOTE_PROFILE) 2>&1) ||
+      warn "could not stop it on $(remote_field $n BH_REMOTE_SSH): ${out//$'\n'/ }"
+    launchctl kill SIGTERM gui/$UID/$(tunnel_label $n) >/dev/null 2>&1
+    print -r -- "$n: ${out:+$out; }tunnel closed"
+    return 0
+  fi
+  # SIGTERM leaves the jobs loaded but not running, and KeepAlive=false keeps them down. The
+  # always-on hub is spared: it is what keeps mcp__playwright__* present in sessions that start
+  # while Chrome is cold. It may be left holding a dead browser context; the next `up` restarts it.
+  # Save the cookies while this Chrome can still read them: an update installed while it ran takes
+  # effect at the next launch, and may not be able to.
+  cookies_auto $n save
+  always_on $n || launchctl kill SIGTERM gui/$UID/$(hub_label $n) >/dev/null 2>&1
+  launchctl kill SIGTERM gui/$UID/$(chrome_label $n) >/dev/null 2>&1
+  wait_port_down $(cdp_port $n) 20 || warn "Chrome for '$n' is still answering after 20s"
+  if always_on $n; then print -r -- "$n Chrome down (hub left up)"
+  else print -r -- "$n down"; fi
+}
+
+cmd_open() {
+  local n=${1:-}; [[ -n $n ]] || die "usage: hubctl open <profile> [url...]"; shift
+  need_profile $n
+  if is_remote $n; then              # the window opens on the other Mac's screen
+    remote_hubctl $n open $(remote_field $n BH_REMOTE_PROFILE) "$@" ||
+      die "could not open it on $(remote_field $n BH_REMOTE_SSH)"
+    return 0
+  fi
+  BH_KEEP_FOCUS=1 cmd_up $n          # a person asked for this window: let it come to the front
+  local c=$(cdp_port $n) u e opened=0
+  for u in "$@"; do
+    # Chrome takes everything after "?" as the URL and unescapes it once. Escape what curl would
+    # otherwise drop (a #fragment) or Chrome would unescape (a literal %).
+    e=${${${u//\%/%25}//\#/%23}// /%20}
+    if curl -sf -m 10 -X PUT "http://localhost:$c/json/new?$e" >/dev/null; then (( ++opened ))
+    else warn "could not open $u"; fi
+  done
+  if (( opened )); then
+    print -r -- "opened $opened tab(s) in '$n'"
+    headless && warn "'$n' runs headless (CHROME_EXTRA_ARGS), so there is no window to use these tabs in" ||
+      print -r -- "they opened in the '$n' profile's Chrome"
+  fi
+  return 0
+}
+
+cmd_add() {
+  local n= identity= ports= remote= rhubctl=
+  while (( $# )); do
+    case $1 in
+      --identity) (( $# >= 2 )) || die "--identity needs a value"; identity=$2; shift 2 ;;
+      --ports)    (( $# >= 2 )) || die "--ports needs a value"; ports=$2; shift 2 ;;
+      --remote)   (( $# >= 2 )) || die "--remote needs a value"; remote=$2; shift 2 ;;
+      --hubctl)   (( $# >= 2 )) || die "--hubctl needs a value"; rhubctl=$2; shift 2 ;;
+      -*)         die "unknown option $1" ;;
+      *)          [[ -z $n ]] && n=$1 || die "unexpected argument $1"; shift ;;
+    esac
+  done
+  [[ -n $n ]] || die "usage: hubctl add <profile> [--identity \"...\"] [--ports CDP:HUB] | --remote <ssh-host>:<profile>"
+  [[ $n == default ]] && die "'default' always exists"
+  valid_name $n || die "profile names are lowercase words joined by dashes, not ending in -<digits> (got '$n')"
+  profile_exists $n && die "profile '$n' already exists"
+  if [[ -n $remote ]]; then
+    [[ -z $ports && -z $identity ]] ||
+      die "--ports and --identity don't apply with --remote: the profile's ports are the other Mac's, and its agent is copied from this Mac's"
+    add_remote $n $remote "$rhubctl"; return
+  fi
+  [[ -z $rhubctl ]] || die "--hubctl only goes with --remote"
+
+  local NEW_CDP NEW_HUB
+  if [[ -n $ports ]]; then
+    [[ $ports == <->:<-> ]] || die "--ports takes CDP:HUB, e.g. 9230:8940"
+    NEW_CDP=${ports%%:*} NEW_HUB=${ports#*:}
+    (( NEW_CDP != NEW_HUB )) || die "the CDP and hub ports must differ"
+    local q p
+    for q in $(profiles); do
+      for p in $(cdp_port $q) $(hub_port $q); do
+        [[ $p == $NEW_CDP || $p == $NEW_HUB ]] && die "port $p already belongs to profile '$q'"
+      done
+    done
+    for p in $NEW_CDP $NEW_HUB; do port_up $p && die "port $p is already in use"; done
+  else
+    read -r NEW_CDP NEW_HUB <<< "$(next_ports)"
+  fi
+
+  secure_profile_dir $n || die "profile '$n' not created: its directory is not private (above)"
+  mkdir -p $OUT_DIR/$n $LOG_DIR
+  link_native_hosts $n
+  apply_job $(chrome_label $n) "$(chrome_plist $n)"
+  apply_job $(hub_label $n) "$(hub_plist $n)"
+  write_agent $n "$identity" 0
+  print -r -- "profile '$n' created — CDP $NEW_CDP, hub http://localhost:$NEW_HUB/mcp, data in $(profile_dir $n)"
+  print -r -- "Next:"
+  print -r -- "  - Sign it in: hubctl open $n https://accounts.google.com   (then any other sites it needs)"
+  [[ -z $identity ]] &&
+    print -r -- "  - Describe it: hubctl agent $n --identity \"who it's signed in as\" --force   (agents are routed by that description)"
+  print -r -- "  - Start a new Claude Code session: agent files load at session start."
+  headless && warn "CHROME_EXTRA_ARGS makes Chrome headless: sign-in needs a window, so remove --headless, regen, sign in, then put it back"
+  return 0
+}
+
+add_remote() {  # name ssh-host:profile remote-hubctl-command
+  local n=$1 spec=$2 rh=${3:-}
+  [[ $spec == ?*:?* ]] || die "--remote takes <ssh-host>:<profile>, e.g. laptop:work"
+  local dest=${spec%:*} rp=${spec##*:}
+  [[ $rp == default ]] || valid_name $rp || die "'$rp' is not a profile name"
+  [[ $dest == [A-Za-z0-9_.@-]## ]] || die "'$dest' doesn't look like an ssh host (use an alias from ~/.ssh/config)"
+  # By default the other Mac's hubctl is at the same path as this one's, with its default config.
+  [[ -n $rh ]] || rh=${(q)HUBCTL}
+  local info rc
+  info=$($SSH_BIN $(ssh_opts) -- $dest "$rh info ${(q)rp}" 2>&1); rc=$?
+  (( rc == 255 )) && die "can't reach $dest over ssh (BatchMode, so the key must work without a prompt): $info"
+  (( rc == 0 )) || die "on $dest, '$rh info $rp' failed (is browser-hub installed there, and is '$rp' a profile? --hubctl gives its path): $info"
+  local h=$(info_field $info hub)
+  [[ $h == <-> ]] || die "unexpected answer from $dest: $info"
+  [[ -n $(info_field $info remote) ]] && die "'$rp' on $dest is itself a remote profile; point at the Mac that runs it"
+  # The tunnel keeps the hub's port number (see tunnel_plist), so it has to be free here.
+  local q p
+  for q in $(profiles); do
+    for p in $(cdp_port $q) $(hub_port $q); do
+      [[ $p == $h ]] && die "port $h ($rp's hub on $dest) is profile '$q''s port here. Give each Mac its own port range: on $dest, set DEFAULT_CDP_PORT/DEFAULT_HUB_PORT apart from this Mac's, or re-add '$rp' there with --ports"
+    done
+  done
+  port_up $h && die "port $h ($rp's hub on $dest) is already in use on this Mac"
+  local NEW_HUB=$h NEW_REMOTE_SSH=$dest NEW_REMOTE_PROFILE=$rp NEW_REMOTE_HUBCTL=$rh
+  mkdir -p $LOG_DIR $RUN_DIR
+  apply_job $(tunnel_label $n) "$(tunnel_plist $n)"
+  unset NEW_HUB NEW_REMOTE_SSH NEW_REMOTE_PROFILE NEW_REMOTE_HUBCTL
+  write_remote_agent $n 0
+  print -r -- "remote profile '$n' created: '$rp' on $dest, through an ssh tunnel on localhost:$h"
+  print -r -- "Next:"
+  profile_exists $rp && ! is_remote $rp &&
+    print -r -- "  - Copy this Mac's '$rp' profile there (logins, extensions): hubctl push $n --stop"
+  print -r -- "  - Start a new Claude Code session: agent files load at session start."
+  return 0
+}
+
+cmd_rm() {
+  local n=${1:-}
+  [[ -n $n ]] || die "usage: hubctl rm <profile>"
+  [[ $n == default ]] && die "refusing to remove the default profile (./uninstall.sh removes everything)"
+  valid_name $n || die "'$n' is not a valid profile name"
+  profile_exists $n || { print -u2 -r -- "hubctl: unknown profile '$n'"; exit 3 }
+  # Only agents that are this profile's: named for it AND pointing at its hub. (A same-named
+  # agent written by hand for something else is left alone.) Read before the plist goes.
+  local h=$(hub_port $n) a
+  local -a agents
+  for a in $AGENTS_DIR/browser-$n.md(N) $AGENTS_DIR/browser-$n-<->.md(N); do
+    [[ -n $h ]] && grep -qF "localhost:$h/mcp" $a && agents+=($a)
+  done
+  local l la remote=0
+  local -a labels=($(hub_label $n) $(chrome_label $n))
+  is_remote $n && { remote=1; labels=($(tunnel_label $n)) }
+  for l in $labels; do
+    lc_bootout $l || warn "launchd still holds $l"
+    la=$(la_of $l)
+    if [[ -L $la || ! -e $la ]]; then rm -f $la; else warn "left $la: it is not a browser-hub symlink"; fi
+    rm -f $(plist_of $l); clear_stale $l
+  done
+  rm -f $RUN_DIR/{last-use,up,hub-restart-owed,failed}-$n(|.lock)(N) $(ssh_sock $n)
+  (( $#agents )) && { rm -f $agents; print -r -- "removed agents: ${(j:, :)${agents[@]:t}}" }
+  if (( remote )); then print -r -- "removed remote profile '$n'. Nothing on the other Mac was touched."
+  else print -r -- "removed profile '$n'. Its browser data (logins, history) is still in $(profile_dir $n)."; fi
+}
+
+cmd_agent() {
+  local n= identity= force=0
+  while (( $# )); do
+    case $1 in
+      --identity) (( $# >= 2 )) || die "--identity needs a value"; identity=$2; shift 2 ;;
+      --force)    force=1; shift ;;
+      -*)         die "unknown option $1" ;;
+      *)          n=$1; shift ;;
+    esac
+  done
+  [[ -n $n ]] || die "usage: hubctl agent <profile> [--identity \"...\"] [--force]"
+  need_profile $n
+  if is_remote $n; then
+    [[ -z $identity ]] || die "a remote profile's agent is copied from this Mac's agent for the same profile; describe that one"
+    write_remote_agent $n $force; return
+  fi
+  write_agent $n "$identity" $force
+}
+
+cmd_lanes() {
+  local n=${1:-} count=${2:-}
+  [[ -n $n && $count == <-> ]] || die "usage: hubctl lanes <profile> <count>"
+  local base=$AGENTS_DIR/browser-$n.md
+  [[ -f $base ]] || die "no base agent at $base (hubctl agent $n)"
+  python3 $BH_ROOT/lib/claude_config.py lanes $base $count
+  print -r -- "One agent per lane: never run two copies of the same lane at once."
+  print -r -- "New agent files load at the next Claude Code session."
+}
+
+cmd_regen() {
+  mkdir -p $PLIST_DIR $LOG_DIR $RUN_DIR
+  rm -rf $STATE_DIR/labels   # the label pages Chromes used to open at launch (before 2026-11-24)
+  local n bad=0 sp=$(paths_with_spaces)
+  [[ -z $sp ]] || die "these paths contain spaces, which browser-hub doesn't support: ${sp//$'\n'/, }"
+  for n in $(profiles); do
+    if is_remote $n; then
+      local tp
+      if tp=$(tunnel_plist $n); then apply_job $(tunnel_label $n) "$tp"
+      else warn "skipped remote profile '$n' (above)"; bad=1; fi
+      continue
+    fi
+    if [[ $n != default ]] && ! { cdp_port $n >/dev/null && hub_port $n >/dev/null }; then
+      warn "skipped '$n': one of its plists is missing (hubctl rm $n, then hubctl add $n)"
+      bad=1; continue
+    fi
+    mkdir -p $OUT_DIR/$n
+    secure_profile_dir $n || { warn "skipped '$n': its profile directory is not private (above)"; bad=1; continue }
+    link_native_hosts $n
+    apply_job $(chrome_label $n) "$(chrome_plist $n)"
+    apply_job $(hub_label $n) "$(hub_plist $n)"
+  done
+  apply_job $REAPER_LABEL "$(reaper_plist)"
+  (( bad )) && return 1
+  print -r -- "launchd jobs are up to date with the config."
+}
+
+cmd_reload() {
+  local n=${1:-}; [[ -n $n ]] || die "usage: hubctl reload <profile>"
+  need_profile $n
+  local was_up=0 l
+  local -a labels=($(chrome_label $n) $(hub_label $n))
+  if is_remote $n; then              # only the tunnel is here; `hubctl reload` on the other Mac does the rest
+    labels=($(tunnel_label $n))
+    tunnel_ok $n && was_up=1
+  else
+    port_up $(cdp_port $n) && was_up=1
+  fi
+  for l in $labels; do
+    link_plist $l
+    lc_reload $l || die "could not reload $l"
+    clear_stale $l
+  done
+  print -r -- "reloaded '$n'"
+  (( was_up )) && cmd_up $n
+  return 0
+}
+
+# Stop a profile once ALL of: its Chrome is up; nothing has asked for it (`hubctl up`, i.e. the
+# hook, a script, or a person) for IDLE_MINUTES; and — for a hub that dies with its Chrome — no
+# client is connected to the hub right now, which protects work that outlives the stamp. The
+# always-on hub has no such guard: every open Claude Code session holds a connection to it whether
+# or not it has browsed, so its port always looks busy and the stamp is the only honest signal.
+cmd_reap() {
+  local n c h st
+  for n in $(profiles); do
+    if is_remote $n; then
+      # Only the tunnel is ours to stop. The other Mac's reaper stops its Chrome, by the stamp
+      # each `up` from here leaves there, and by the connections the tunnel holds open.
+      h=$(hub_port $n) || continue
+      port_up $h || continue
+      st=$RUN_DIR/last-use-$n
+      [[ -f $st ]] && (( EPOCHSECONDS - $(zstat +mtime $st) < IDLE_MINUTES * 60 )) && continue
+      [[ -n $(lsof -nP -iTCP:$h -sTCP:ESTABLISHED 2>/dev/null) ]] && continue
+      launchctl kill SIGTERM gui/$UID/$(tunnel_label $n) >/dev/null 2>&1
+      log_line "closed the idle tunnel for $n"
+      continue
+    fi
+    c=$(cdp_port $n) || continue
+    port_up $c || continue
+    # A crash or a reboot gets no save at shutdown, so a running Chrome is saved on a timer too.
+    local cf=$(cookie_file $n)
+    [[ -f $cf ]] && (( EPOCHSECONDS - $(zstat +mtime $cf) < COOKIE_SAVE_MINUTES * 60 )) || cookies_auto $n save
+    st=$RUN_DIR/last-use-$n
+    [[ -f $st ]] && (( EPOCHSECONDS - $(zstat +mtime $st) < IDLE_MINUTES * 60 )) && continue
+    if ! always_on $n; then
+      h=$(hub_port $n)
+      [[ -n $h && -n $(lsof -nP -iTCP:$h -sTCP:ESTABLISHED 2>/dev/null) ]] && continue
+    fi
+    log_line "reaped $n (idle): $(cmd_down $n 2>&1)"
+  done
+  # Housekeeping. Screenshots and console logs pile up in the output dirs forever otherwise.
+  if (( OUTPUT_RETENTION_DAYS > 0 )) && [[ -d $OUT_DIR ]]; then
+    find $OUT_DIR -type f -mtime +$OUTPUT_RETENTION_DAYS -delete 2>/dev/null
+  fi
+  rotate_log $LOG_DIR/ensure-profile.log
+  rotate_log $LOG_DIR/reaper.log
+  return 0
+}
+
+cmd_doctor() {  # [--no-mcp] [--no-hooks] [--no-claude-md]: parts deliberately not installed
+  local fails=0 warns=0 n l p la v major out a chk_mcp=1 chk_hooks=1 chk_md=1
+  local -a s
+  for a in "$@"; do
+    case $a in
+      --no-mcp) chk_mcp=0 ;; --no-hooks) chk_hooks=0 ;; --no-claude-md) chk_md=0 ;;
+      *) die "usage: hubctl doctor [--no-mcp] [--no-hooks] [--no-claude-md]" ;;
+    esac
+  done
+  ok()   { print -r -- "  ok    $*" }
+  bad()  { print -r -- "  FAIL  $*"; (( ++fails )) }
+  meh()  { print -r -- "  warn  $*"; (( ++warns )) }
+  print -r -- "browser-hub $BH_VERSION — $BH_ROOT"
+  print -r -- "config $BH_CONFIG"
+  print -r -- "system"
+  [[ -r $BH_CONFIG ]] && ok "config file present" || bad "no config file — run ./install.sh"
+  [[ $OSTYPE == darwin* ]] && ok "macOS" || bad "macOS is required (launchd)"
+  [[ -x $CHROME ]] && ok "Chrome: $CHROME" || bad "no Chrome at CHROME=$CHROME"
+  if [[ -x $NODE_BIN/npx ]]; then
+    v=$($NODE_BIN/node --version 2>/dev/null); major=${${v#v}%%.*}
+    [[ $major == <-> ]] && (( major >= 18 )) && ok "node $v in $NODE_BIN" ||
+      bad "node 18+ is needed; $NODE_BIN/node is ${v:-missing}"
+    [[ $NODE_BIN == */.nvm/versions/* ]] &&
+      meh "NODE_BIN is inside nvm; the hubs stop working if that node version is ever removed"
+  else
+    bad "no npx in NODE_BIN=$NODE_BIN"
+  fi
+  (( $+commands[python3] )) && ok "python3" || bad "python3 not found (install Xcode command line tools)"
+  local sp=$(paths_with_spaces)
+  [[ -z $sp ]] || bad "paths with spaces aren't supported: ${sp//$'\n'/, }"
+
+  print -r -- "profiles"
+  for n in $(profiles); do
+    s=()
+    if is_remote $n; then doctor_remote $n; continue; fi
+    if [[ $n != default ]] && ! hub_port $n >/dev/null; then
+      bad "$n: incomplete — its hub plist is missing (hubctl rm $n, then hubctl add $n)"; continue
+    fi
+    for l in $(chrome_label $n) $(hub_label $n); do
+      p=$(plist_of $l) la=$(la_of $l)
+      if [[ ! -f $p ]]; then bad "$l: no plist (run: hubctl regen)"; continue; fi
+      plutil -lint -s $p >/dev/null || bad "$l: invalid plist $p"
+      [[ $(readlink $la) == $p ]] || bad "$l: $la does not point at $p (run: hubctl regen)"
+      lc_loaded $l || bad "$l: not loaded into launchd (run: hubctl regen)"
+      is_stale $l && meh "$l: changed while running; applies at its next start (or: hubctl reload $n)"
+    done
+    if [[ $n != default && -z $(agents_using $(hub_port $n)) ]]; then
+      meh "$n: no agent points at its hub, so nothing can use it (run: hubctl agent $n)"
+    fi
+    for l in ${(f)"$(profile_perms $n)"}; do bad "$n: $l (run: hubctl regen)"; done
+    native_hosts_ok $n || meh "$n: extensions can't reach their desktop apps (no native-messaging link; run: hubctl regen)"
+    if (( COOKIE_BACKUP )) && port_up $(cdp_port $n); then
+      local cf=$(cookie_file $n)
+      if [[ ! -f $cf ]]; then meh "$n: no saved cookies yet; a Chrome update could lose its logins (run: hubctl cookies $n save)"
+      elif (( EPOCHSECONDS - $(zstat +mtime $cf) > 86400 * 2 )); then meh "$n: saved cookies are $(age_of $cf) old (the reaper should refresh them hourly; see $LOG_DIR/cookies.log)"
+      fi
+    fi
+    port_up $(cdp_port $n) && s+=("Chrome up") || s+=("Chrome down")
+    port_up $(hub_port $n) && s+=("hub up") || s+=("hub down")
+    ok "$n: CDP $(cdp_port $n), hub $(hub_port $n) — ${(j:, :)s}"
+  done
+  if port_up $DEFAULT_HUB_PORT; then
+    mcp_ping $DEFAULT_HUB_PORT && ok "the default hub answers MCP on :$DEFAULT_HUB_PORT" ||
+      bad "something is on :$DEFAULT_HUB_PORT but it doesn't answer MCP (see $LOG_DIR/hub-default.log)"
+  else
+    bad "nothing listening on :$DEFAULT_HUB_PORT — the default hub must always be up (run: hubctl regen)"
+  fi
+  lc_loaded $REAPER_LABEL && ok "idle reaper loaded (every ${REAP_INTERVAL_MINUTES}m, stops after ${IDLE_MINUTES}m idle)" ||
+    bad "idle reaper not loaded (run: hubctl regen)"
+  for la in $LAUNCH_AGENTS_DIR/$LABEL_PREFIX.(agent-chrome|playwright-hub|browser-hub-reaper|browser-tunnel)*.plist(N); do
+    [[ $(readlink $la) == $PLIST_DIR/* && -e $la ]] ||
+      bad "stray launchd entry $la (from an older install?) — unload and delete it"
+  done
+
+  print -r -- "claude code"
+  if (( ! chk_hooks )); then
+    meh "hooks not checked (--no-hooks)"
+  elif out=$(claude_config hooks-check $CLAUDE_SETTINGS "$(hook_command)" $TOOL_MATCHER 2>&1); then
+    ok "PreToolUse hooks registered in $CLAUDE_SETTINGS"
+  else
+    bad "PreToolUse hooks in $CLAUDE_SETTINGS are wrong (run ./install.sh): ${out//$'\n'/; }"
+  fi
+  local claude=${CLAUDE_BIN:-claude}
+  if (( ! chk_mcp )); then
+    meh "MCP registration not checked (--no-mcp)"
+  elif (( $+commands[$claude] )) || [[ -x $claude ]]; then
+    out=$($claude mcp get playwright 2>&1)
+    [[ $out == *"http://localhost:$DEFAULT_HUB_PORT/mcp"* ]] &&
+      ok "MCP server 'playwright' -> http://localhost:$DEFAULT_HUB_PORT/mcp" ||
+      bad "MCP server 'playwright' is not this hub (run ./install.sh): ${${out//$'\n'/ }[1,160]}"
+  else
+    meh "no 'claude' CLI on PATH, so the MCP registration can't be checked"
+  fi
+  (( chk_md )) || meh "CLAUDE.md not checked (--no-claude-md)"
+  (( chk_md )) && case $(claude_config md-check $CLAUDE_MD) in
+    managed) ok "browser rules block present in $CLAUDE_MD" ;;
+    other)   meh "$CLAUDE_MD holds a different install's rules block, not this one's" ;;
+    custom)  ok "$CLAUDE_MD has its own browser-hub section (not managed by install.sh)" ;;
+    *)       meh "$CLAUDE_MD has no browser rules; agents won't know the tab etiquette (run ./install.sh)" ;;
+  esac
+
+  print -r -- ""
+  if (( fails )); then print -r -- "$fails problem(s), $warns warning(s)"; return 1; fi
+  (( warns )) && print -r -- "healthy, $warns warning(s)" || print -r -- "healthy"
+  return 0
+}
+
+cmd_cookies() {  # profile save|restore [--from <file>]
+  local n=${1:-} mode=${2:-}
+  [[ -n $n && ( $mode == save || $mode == restore ) ]] || die "usage: hubctl cookies <profile> save | restore [--from <file>]"
+  shift 2
+  need_profile $n
+  is_remote $n && die "'$n' runs on another Mac: run this there"
+  port_up $(cdp_port $n) || cmd_up $n >/dev/null || return 1
+  cookies_run $n $mode "$@"
+  local rc=$?
+  (( rc == 5 )) && warn "kept the saved copy: this Chrome's jar shrank by more than half since an update (hubctl cookies $n restore puts it back)"
+  stamp $n
+  return $rc
+}
+
+# Called from cmd_doctor, with its ok/bad/meh. A sleeping laptop is a warning, not a failure.
+doctor_remote() {  # profile
+  local n=$1 l=$(tunnel_label $1) p la h rp dest info rc q
+  p=$(plist_of $l) la=$(la_of $l)
+  h=$(hub_port $n) rp=$(remote_field $n BH_REMOTE_PROFILE) dest=$(remote_field $n BH_REMOTE_SSH)
+  plutil -lint -s $p >/dev/null || bad "$l: invalid plist $p"
+  [[ $(readlink $la) == $p ]] || bad "$l: $la does not point at $p (run: hubctl regen)"
+  lc_loaded $l || bad "$l: not loaded into launchd (run: hubctl regen)"
+  is_stale $l && meh "$l: changed while running; applies at its next start (or: hubctl reload $n)"
+  [[ -z $(agents_using $h) ]] && meh "$n: no agent points at its tunnel, so nothing can use it (run: hubctl agent $n)"
+  for q in $(profiles); do
+    [[ $q == $n ]] && continue
+    [[ $(cdp_port $q 2>/dev/null) == $h || $(hub_port $q 2>/dev/null) == $h ]] &&
+      bad "$n: its port $h is also profile '$q''s; the tunnel can't bind it"
+  done
+  info=$(remote_hubctl $n info $rp 2>&1); rc=$?
+  if (( rc == 255 )); then
+    meh "$n: can't reach $dest over ssh right now (asleep or offline?): ${${info//$'\n'/ }[1,120]}"
+  elif (( rc != 0 )); then
+    bad "$n: on $dest, 'hubctl info $rp' failed: ${${info//$'\n'/ }[1,160]}"
+  elif [[ $(info_field $info hub) != $h ]]; then
+    bad "$n: '$rp' on $dest now has hub port $(info_field $info hub), not $h (hubctl rm $n, then add it again)"
+  else
+    ok "$n: '$rp' on $dest (Chrome $(info_field $info chrome) there), tunnel :$h $(tunnel_ok $n && print up || print down)"
+  fi
+}
+
+# push/pull: make one Mac's copy of a profile the same as the other's. One direction at a time,
+# never a merge: two cookie jars can't be merged safely. Both Chromes must be down (a live profile
+# copies torn), and both stay held down for the copy: `hubctl up` waits on the profile's lock here,
+# and `hubctl held` keeps it on the other Mac. The copy it replaces is kept beside it as
+# <dir>.before-copy-<time>, an APFS clone, so it costs no space until the two drift apart.
+cmd_copy() {  # push|pull profile [--stop]
+  local dir=$1 n=${2:-} stop=0 a
+  [[ -n $n ]] || die "usage: hubctl $dir <remote-profile> [--stop]"
+  for a in ${@[3,-1]}; do [[ $a == --stop ]] && stop=1 || die "unknown option $a"; done
+  need_profile $n
+  is_remote $n || die "'$n' isn't a remote profile (hubctl list); $dir copies between this Mac and another"
+  local rp=$(remote_field $n BH_REMOTE_PROFILE) dest=$(remote_field $n BH_REMOTE_SSH)
+  local rh=$(remote_field $n BH_REMOTE_HUBCTL)
+  profile_exists $rp && ! is_remote $rp || die "there is no profile '$rp' on this Mac to copy $([[ $dir == push ]] && print from || print to)"
+  (( $+commands[$RSYNC_BIN] )) || [[ -x $RSYNC_BIN ]] || die "no rsync ($RSYNC_BIN)"
+
+  local info rc rdir rchrome ldir=$(profile_dir $rp) lc=$(cdp_port $rp)
+  info=$(remote_hubctl $n info $rp 2>&1); rc=$?
+  (( rc == 0 )) || die "can't ask $dest about '$rp': ${info//$'\n'/ }"
+  rdir=$(info_field $info dir) rchrome=$(info_field $info chrome)
+  [[ $rdir == /?* ]] || die "unexpected answer from $dest: $info"
+  local lup=0; chrome_stopped $rp || lup=1
+  if (( lup )) || [[ $rchrome == up ]]; then
+    (( stop )) || die "'$rp' is running $( (( lup )) && print here)$([[ $rchrome == up ]] && print " on $dest"). Copying a live profile tears it: pass --stop (closes its tabs), or wait for the reaper"
+    (( lup )) && { cmd_down $rp >/dev/null && wait_chrome_stopped $rp 20 || die "could not stop '$rp' here" }
+    # The other Mac's `held` waits for its Chrome to finish exiting, as this side just did.
+    [[ $rchrome == up ]] && { remote_hubctl $n down $rp >/dev/null || die "could not stop '$rp' on $dest" }
+  fi
+
+  # Hold this side for the whole copy. The other side is held by `hubctl held` around each step.
+  local lockfd lock=$RUN_DIR/up-$rp.lock
+  mkdir -p $RUN_DIR; [[ -e $lock ]] || : >> $lock
+  zsystem flock -t 30 -f lockfd $lock || die "'$rp' is starting here; try again in a moment"
+  chrome_stopped $rp || die "'$rp' started again here; nothing was copied"
+
+  local -a ex rs
+  for a in $COPY_EXCLUDES; do ex+=(--exclude=$a); done
+  # rsync splits -e on spaces only: the options must be joined with spaces, not print -l's newlines.
+  local -a so=($(ssh_opts))
+  local sshcmd="$SSH_BIN -S $(ssh_sock $n) -o ControlMaster=no ${so[*]}"
+  local held="$rh held ${(q)rp}"
+  # The copy being replaced is kept as <dir>.before-copy-<time>, and only the newest two are kept,
+  # so a second push by mistake doesn't destroy the only copy of what was there first.
+  local suffix=.before-copy-$(strftime '%Y%m%d-%H%M%S' $EPOCHSECONDS)
+  local keep='[ -d "$1" ] || exit 0
+    /bin/cp -cRp "$1" "$1$2" || exit 1
+    # The kept copy holds live cookies: private, or not kept at all.
+    chmod 700 "$1$2" && [ "$(stat -f %Lp "$1$2")" = 700 ] || { chflags -R nouchg "$1$2"; rm -rf "$1$2"; exit 1; }
+    i=0; for b in $(ls -1d "$1".before-copy-* | sort -r); do i=$((i+1)); [ $i -le 2 ] || rm -rf "$b"; done'
+  local before
+  # An older install may have left this Mac's copy readable by others; rsync -a would carry that
+  # mode to the other side, and the replaced copy kept below would inherit it.
+  [[ ! -d $ldir ]] || secure_profile_dir $rp || die "this Mac's copy of '$rp' is not private (above); nothing was copied"
+  if [[ $dir == push ]]; then
+    remote_hubctl $n held $rp /bin/sh -c $keep sh $rdir $suffix || die "could not set $dest's copy aside; nothing was copied"
+    rs=($ldir/ $dest:$rdir/) before=$dest:$rdir$suffix
+  else
+    /bin/sh -c $keep sh $ldir $suffix || die "could not set this Mac's copy aside; nothing was copied"
+    secure_profile_dir $rp || die "this Mac's copy of '$rp' is not private (above); nothing was copied"
+    rs=($dest:$rdir/ $ldir/) before=$ldir$suffix
+  fi
+  print -r -- "copying '$rp' $([[ $dir == push ]] && print "this Mac -> $dest" || print "$dest -> this Mac")..."
+  local rc=0
+  $RSYNC_BIN -a --delete --stats $ex -e $sshcmd --rsync-path="$held rsync" $rs || rc=$?
+  # rsync -a copies the other side's modes, and an older install there may have left them loose.
+  # That happens even when the transfer then fails partway, so this runs before checking rc.
+  if [[ $dir == pull ]]; then
+    secure_profile_dir $rp || die "this Mac's copy of '$rp' is not private after the copy (above); fix it before starting it"
+  fi
+  (( rc == 0 )) || die "rsync failed. The copy it was replacing is in $before"
+  print -r -- "done. Both copies of '$rp' stay stopped until a browser call starts them."
+  print -r -- "The copy that was replaced is in $before (delete it once you're happy)"
+}
+
+# Run a command while a profile is held down: its Chrome must be stopped, and `hubctl up` waits
+# until the command finishes. push/pull run their remote half (the rsync server) under it.
+cmd_held() {  # profile command...
+  local n=${1:-}
+  [[ -n $n && $# -ge 2 ]] || die "usage: hubctl held <profile> <command...>"
+  shift
+  need_profile $n
+  is_remote $n && die "hold '$n' on the Mac that runs it"
+  local lockfd lock=$RUN_DIR/up-$n.lock
+  mkdir -p $RUN_DIR; [[ -e $lock ]] || : >> $lock
+  zsystem flock -t 30 -f lockfd $lock || die "'$n' is starting; try again in a moment"
+  # Chrome closes its DevTools port early in shutdown and writes its databases after, so wait for
+  # the process itself to be gone too.
+  port_up $(cdp_port $n) && die "'$n' is running (its Chrome is up); stop it first: hubctl down $n"
+  wait_chrome_stopped $n 20 || die "'$n' Chrome is still shutting down; try again in a moment"
+  "$@"
+}
+
+case ${1:-list} in
+  list)                 cmd_list ;;
+  up|down|open|add|rm|agent|lanes|regen|reload|reap|doctor|run|info|held|cookies) f=cmd_$1; shift; $f "$@" ;;
+  push|pull)            cmd_copy "$@" ;;
+  version|--version|-v) print -r -- "browser-hub $BH_VERSION" ;;
+  help|--help|-h)       usage ;;
+  *)                    usage >&2; exit 2 ;;
+esac

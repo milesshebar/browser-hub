@@ -1,0 +1,74 @@
+# browser-hub config. zsh syntax, sourced by hubctl, the hook and the idle reaper.
+# install.sh copies this to ~/.config/browser-hub/config on first run, filling in what it detects.
+# After changing anything here, run `hubctl regen` to rewrite and reload the launchd jobs.
+# A config somewhere else (e.g. a sandbox) is selected with BROWSER_HUB_CONFIG=<path>; the hook,
+# the reaper and generated agents are all told about it.
+
+# launchd labels become <LABEL_PREFIX>.agent-chrome[-<profile>], <LABEL_PREFIX>.playwright-hub[-<profile>]
+# and <LABEL_PREFIX>.browser-hub-reaper.
+LABEL_PREFIX=com.yourname
+
+# The browser: a real Google Chrome install, so that 1Password and other extensions trust it.
+CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+# The directory holding npx (node 18+). Pick a path that survives node upgrades and works under
+# launchd: Homebrew's /opt/homebrew/bin (/usr/local/bin on Intel) does; an nvm version directory
+# or a version manager's shim does not.
+NODE_BIN=/opt/homebrew/bin
+
+# The playwright-mcp version the hubs run. Pinned on purpose, because npx would otherwise upgrade
+# it under you. docs/DESIGN.md lists what to re-check before changing it.
+PW_MCP=@playwright/mcp@0.0.85
+
+# Browser profiles: cookies, logins, history. Never commit or sync these (which is why they're
+# not under ~/.claude, a folder many people keep in git). No spaces in any path here.
+PROFILES_DIR=$HOME/.local/share/browser-hub/profiles
+DEFAULT_PROFILE_DIR=$PROFILES_DIR/default
+
+# The default profile's ports. Each new profile gets the next free pair above these. With more than
+# one Mac (remote profiles), give each its own range, e.g. 9323/9031 on the second: a remote
+# profile's tunnel uses the same port number on both Macs.
+DEFAULT_CDP_PORT=9223
+DEFAULT_HUB_PORT=8931
+
+# Agents that aren't named browser-<profile> but still drive a profile, so the hook knows which
+# Chrome to start when they spawn. Keys are agent names or their MCP server names; values are profiles.
+#   AGENT_PROFILES=([shopper]=default [browser-shopper]=default)
+AGENT_PROFILES=()
+
+# Native-messaging hosts (how an extension talks to its desktop app, e.g. 1Password). Chrome looks
+# for them in each profile's own user-data-dir, so hubctl links these manifests from the stock
+# Chrome directory into every profile (on add, regen and up). Names without the .json.
+# NATIVE_HOSTS=(com.1password.1password)
+# NATIVE_HOSTS_SRC=$HOME/Library/Application\ Support/Google/Chrome/NativeMessagingHosts
+
+# Lifecycle.
+IDLE_MINUTES=120           # stop a profile's Chrome after this long with no browser use
+REAP_INTERVAL_MINUTES=15   # how often the idle reaper runs
+OUTPUT_RETENTION_DAYS=30   # delete screenshots and console logs older than this (0 = keep forever)
+LOG_MAX_MB=10              # rotate a log once it passes this size
+
+# Tuning.
+ACTION_TIMEOUT_MS=15000    # playwright-mcp's per-action budget; its own 5000 ms default is too short for heavy pages
+FOCUS_GUARD=1              # 1: agents' tabs open in windows behind yours, so they don't take keyboard focus (best effort: DESIGN §11 lists the exceptions); 0: hubs talk to Chrome directly
+SNAPSHOT_MODE=none         # "none": no page snapshot after each click/navigate (agents ask for one; the agent rules assume this); "full": playwright-mcp's default
+DISK_CACHE_BYTES=209715200 # cap each profile's HTTP cache at 200 MB (0 = Chrome's default, which grows to GBs)
+CHROME_EXTRA_ARGS=()       # extra Chrome flags, e.g. (--headless=new) on a machine nobody looks at
+
+# Logins across Chrome updates: hubctl saves each profile's cookies (from the running Chrome) when
+# it stops it and every COOKIE_SAVE_MINUTES, and puts them back when an update drops them (DESIGN §1).
+COOKIE_BACKUP=1
+COOKIE_SAVE_MINUTES=60
+
+# Remote profiles (`hubctl add <name> --remote <ssh-host>:<profile>`) go over ssh, and push/pull
+# copies use rsync. These rarely change, except to a stub in tests.
+# SSH_BIN=/usr/bin/ssh
+# RSYNC_BIN=rsync
+
+# Locations. The defaults are shown. They rarely need changing, except for a sandbox or second
+# instance, which needs every one of them (plus LABEL_PREFIX and the two ports) to be its own.
+# STATE_DIR=<this repo>/var       generated plists, logs, screenshots, run stamps
+# LAUNCH_AGENTS_DIR=$HOME/Library/LaunchAgents
+# AGENTS_DIR=$HOME/.claude/agents
+# CLAUDE_MD=$HOME/.claude/CLAUDE.md
+# CLAUDE_SETTINGS=$HOME/.claude/settings.json
